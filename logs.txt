@@ -1,0 +1,6 @@
+{
+    "events": [
+        {
+            "timestamp": 1782393128408,
+            "message": 
+aws: [ERROR]: 'charmap' codec can't encode character '\u25c7' in position 1: character maps to <undefined>
