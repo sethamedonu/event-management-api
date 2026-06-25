@@ -1,290 +1,168 @@
-// ============================================================
-// FILE: controllers/eventController.js
-// ------------------------------------------------------------
-// WHAT THIS FILE DOES:
-//   This is where the LOGIC lives. When a request comes in,
-//   the route file decides "who handles this?" and the controller
-//   is the one who actually does the work:
-//     - Reading from the events array
-//     - Adding a new event
-//     - Updating or deleting one
-//     - Sending back the response to the user
-//
-// THINK OF IT LIKE THIS:
-//   The route is a traffic sign that points you in the right
-//   direction. The controller is the actual destination — the
-//   person who does the real work when you arrive.
-//
-// WHAT ARE req AND res?
-//   - req (request):  Everything the USER sent to us.
-//                     Body data, URL parameters, headers, etc.
-//   - res (response): Our tool for sending something BACK to the user.
-//                     We use res.json() to send JSON data.
-// ============================================================
+const { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand } = require("@aws-sdk/lib-dynamodb");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { v4: uuidv4 } = require("uuid");
+const { db, TABLE } = require("../data/db.js");
 
-// Pull in our "database" (the array from data/events.js)
-// require() is how Node.js imports things from other files
-const events = require("../data/events.js");
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+const BUCKET = process.env.S3_BUCKET;
 
 // -------------------------------------------------------
-// HELPER: nextId()
+// Validation helper
 // -------------------------------------------------------
-// WHY DO WE NEED THIS?
-//   Every event needs a unique ID so we can find, update,
-//   or delete it later. In a real database, the DB generates
-//   this automatically. Since we're using an array, we do it
-//   ourselves by finding the highest existing ID and adding 1.
-// -------------------------------------------------------
-function nextId() {
-  if (events.length === 0) {
-    // If there are no events yet, start IDs at 1
-    return 1;
-  }
-  // Math.max(...) finds the largest number in a list.
-  // We spread the array of IDs using "..." so Math.max can read them.
-  // Example: if IDs are [1, 2, 3], Math.max(1, 2, 3) returns 3, then +1 = 4
-  const highestId = Math.max(...events.map((event) => event.id));
-  return highestId + 1;
-}
-
-// -------------------------------------------------------
-// CONTROLLER 1: getAllEvents
-// Handles: GET /events
-// -------------------------------------------------------
-// PURPOSE: Return every event in our array to the user
-// -------------------------------------------------------
-function getAllEvents(req, res) {
-  // res.json() converts our JavaScript object into JSON format
-  // and sends it back to whoever made the request.
-  // The HTTP status 200 means "OK / Success".
-  return res.status(200).json({
-    success: true,
-    message: "All events retrieved successfully",
-    data: events, // Send the entire events array
-  });
-}
-
-// -------------------------------------------------------
-// CONTROLLER 2: getEventById
-// Handles: GET /events/:id
-// -------------------------------------------------------
-// PURPOSE: Find and return ONE event that matches the given ID
-//
-// WHAT IS :id?
-//   When the user visits /events/3, Express captures "3"
-//   and puts it in req.params.id for us to use.
-// -------------------------------------------------------
-function getEventById(req, res) {
-  // req.params.id comes in as a STRING like "3"
-  // We use Number() to convert it to an actual number (3)
-  // because our IDs in the array are numbers, not strings
-  const id = Number(req.params.id);
-
-  // Array.find() goes through each event and returns the FIRST
-  // one where event.id matches our id. If nothing matches, it returns undefined.
-  const event = events.find((event) => event.id === id);
-
-  // If no event was found, we send a 404 (Not Found) response
-  if (!event) {
-    return res.status(404).json({
-      success: false,
-      message: `No event found with ID ${id}`,
-      data: null,
-    });
-  }
-
-  // If we found it, send it back with a 200 OK
-  return res.status(200).json({
-    success: true,
-    message: "Event retrieved successfully",
-    data: event,
-  });
-}
-
-// -------------------------------------------------------
-// CONTROLLER 3: createEvent
-// Handles: POST /events
-// -------------------------------------------------------
-// PURPOSE: Add a brand new event to our array
-//
-// WHERE DOES THE DATA COME FROM?
-//   The user sends a JSON body in their request, like:
-//   {
-//     "title": "My Event",
-//     "description": "...",
-//     "date": "2025-10-01",
-//     "location": "Nairobi"
-//   }
-//   Express puts that body in req.body for us (because we
-//   use express.json() middleware in app.js).
-// -------------------------------------------------------
-function createEvent(req, res) {
-  const { title, description, date, location } = req.body;
-
-  // Trim whitespace and validate all fields are present and non-empty
+function validateFields({ title, description, date, location }) {
   const t = title?.trim();
   const d = description?.trim();
   const loc = location?.trim();
   const dt = date?.trim();
 
-  if (!t || !d || !dt || !loc) {
-    return res.status(400).json({
-      success: false,
-      message: "All fields are required: title, description, date, location",
-      data: null,
-    });
-  }
+  if (!t || !d || !dt || !loc)
+    return "All fields are required: title, description, date, location";
+  if (t.length > 100) return "title max 100 chars";
+  if (d.length > 500) return "description max 500 chars";
+  if (loc.length > 200) return "location max 200 chars";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dt) || isNaN(Date.parse(dt)))
+    return "date must be a valid date in YYYY-MM-DD format";
 
-  // Validate field lengths
-  if (t.length > 100 || d.length > 500 || loc.length > 200) {
-    return res.status(400).json({
-      success: false,
-      message: "title max 100 chars, description max 500 chars, location max 200 chars",
-      data: null,
-    });
-  }
+  return null;
+}
 
-  // Validate date format (YYYY-MM-DD)
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dt) || isNaN(Date.parse(dt))) {
-    return res.status(400).json({
-      success: false,
-      message: "date must be a valid date in YYYY-MM-DD format",
-      data: null,
-    });
+// -------------------------------------------------------
+// GET /events
+// -------------------------------------------------------
+async function getAllEvents(req, res) {
+  try {
+    const result = await db.send(new ScanCommand({ TableName: TABLE }));
+    const events = (result.Items || []).sort((a, b) => a.createdAt - b.createdAt);
+    return res.status(200).json({ success: true, message: "All events retrieved successfully", data: events });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to retrieve events", data: null });
   }
+}
+
+// -------------------------------------------------------
+// GET /events/:id
+// -------------------------------------------------------
+async function getEventById(req, res) {
+  try {
+    const result = await db.send(new GetCommand({ TableName: TABLE, Key: { id: req.params.id } }));
+    if (!result.Item)
+      return res.status(404).json({ success: false, message: `No event found with ID ${req.params.id}`, data: null });
+    return res.status(200).json({ success: true, message: "Event retrieved successfully", data: result.Item });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to retrieve event", data: null });
+  }
+}
+
+// -------------------------------------------------------
+// POST /events
+// -------------------------------------------------------
+async function createEvent(req, res) {
+  const { title, description, date, location, imageUrl } = req.body;
+  const error = validateFields({ title, description, date, location });
+  if (error) return res.status(400).json({ success: false, message: error, data: null });
 
   const newEvent = {
-    id: nextId(),
-    title: t,
-    description: d,
-    date: dt,
-    location: loc,
+    id: uuidv4(),
+    title: title.trim(),
+    description: description.trim(),
+    date: date.trim(),
+    location: location.trim(),
+    imageUrl: imageUrl || null,
+    createdAt: Date.now(),
   };
 
-  // Add the new event to our array
-  // push() appends an item to the end of an array
-  events.push(newEvent);
-
-  // Send back a 201 Created response with the new event
-  // 201 is the "correct" status code for successfully creating something
-  return res.status(201).json({
-    success: true,
-    message: "Event created successfully",
-    data: newEvent,
-  });
+  try {
+    await db.send(new PutCommand({ TableName: TABLE, Item: newEvent }));
+    return res.status(201).json({ success: true, message: "Event created successfully", data: newEvent });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to create event", data: null });
+  }
 }
 
 // -------------------------------------------------------
-// CONTROLLER 4: updateEvent
-// Handles: PUT /events/:id
+// PUT /events/:id
 // -------------------------------------------------------
-// PURPOSE: Find an event by ID and overwrite its fields
-//          with new data from the request body.
-//
-// PUT means "replace the whole thing". The user sends
-// all the fields they want, and we update the event.
-// -------------------------------------------------------
-function updateEvent(req, res) {
-  const id = Number(req.params.id);
+async function updateEvent(req, res) {
+  const { id } = req.params;
+  const { title, description, date, location, imageUrl } = req.body;
+  const error = validateFields({ title, description, date, location });
+  if (error) return res.status(400).json({ success: false, message: error, data: null });
 
-  // Find the INDEX (position) of the event in the array.
-  // findIndex() is like find() but returns the position number (0, 1, 2...)
-  // instead of the actual object. We need the index to update it in place.
-  const eventIndex = events.findIndex((event) => event.id === id);
+  try {
+    const existing = await db.send(new GetCommand({ TableName: TABLE, Key: { id } }));
+    if (!existing.Item)
+      return res.status(404).json({ success: false, message: `No event found with ID ${id}`, data: null });
 
-  // findIndex() returns -1 if nothing was found
-  if (eventIndex === -1) {
-    return res.status(404).json({
-      success: false,
-      message: `No event found with ID ${id}`,
-      data: null,
-    });
+    const result = await db.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: { id },
+      UpdateExpression: "SET #title = :title, description = :description, #date = :date, #location = :location, imageUrl = :imageUrl",
+      ExpressionAttributeNames: { "#title": "title", "#date": "date", "#location": "location" },
+      ExpressionAttributeValues: {
+        ":title": title.trim(),
+        ":description": description.trim(),
+        ":date": date.trim(),
+        ":location": location.trim(),
+        ":imageUrl": imageUrl || existing.Item.imageUrl || null,
+      },
+      ReturnValues: "ALL_NEW",
+    }));
+
+    return res.status(200).json({ success: true, message: "Event updated successfully", data: result.Attributes });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to update event", data: null });
   }
-
-  const { title, description, date, location } = req.body;
-
-  const t = title?.trim();
-  const d = description?.trim();
-  const loc = location?.trim();
-  const dt = date?.trim();
-
-  if (!t || !d || !dt || !loc) {
-    return res.status(400).json({
-      success: false,
-      message: "All fields are required: title, description, date, location",
-      data: null,
-    });
-  }
-
-  if (t.length > 100 || d.length > 500 || loc.length > 200) {
-    return res.status(400).json({
-      success: false,
-      message: "title max 100 chars, description max 500 chars, location max 200 chars",
-      data: null,
-    });
-  }
-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dt) || isNaN(Date.parse(dt))) {
-    return res.status(400).json({
-      success: false,
-      message: "date must be a valid date in YYYY-MM-DD format",
-      data: null,
-    });
-  }
-
-  events[eventIndex] = {
-    ...events[eventIndex],
-    title: t,
-    description: d,
-    date: dt,
-    location: loc,
-  };
-
-  return res.status(200).json({
-    success: true,
-    message: "Event updated successfully",
-    data: events[eventIndex],
-  });
 }
 
 // -------------------------------------------------------
-// CONTROLLER 5: deleteEvent
-// Handles: DELETE /events/:id
+// DELETE /events/:id
 // -------------------------------------------------------
-// PURPOSE: Remove an event from the array permanently
-// -------------------------------------------------------
-function deleteEvent(req, res) {
-  const id = Number(req.params.id);
+async function deleteEvent(req, res) {
+  const { id } = req.params;
+  try {
+    const existing = await db.send(new GetCommand({ TableName: TABLE, Key: { id } }));
+    if (!existing.Item)
+      return res.status(404).json({ success: false, message: `No event found with ID ${id}`, data: null });
 
-  // Find the index of the event to delete
-  const eventIndex = events.findIndex((event) => event.id === id);
+    // Delete image from S3 if exists
+    if (existing.Item.imageUrl) {
+      const key = existing.Item.imageUrl.split(".amazonaws.com/")[1];
+      if (key) {
+        await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key })).catch(() => {});
+      }
+    }
 
-  if (eventIndex === -1) {
-    return res.status(404).json({
-      success: false,
-      message: `No event found with ID ${id}`,
-      data: null,
-    });
+    await db.send(new DeleteCommand({ TableName: TABLE, Key: { id } }));
+    return res.status(200).json({ success: true, message: "Event deleted successfully", data: existing.Item });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to delete event", data: null });
   }
-
-  // splice() removes items from an array at a given index.
-  // splice(eventIndex, 1) means: "starting at eventIndex, remove 1 item"
-  // splice() also RETURNS the removed items as an array, so [0] gets the first one.
-  const deletedEvent = events.splice(eventIndex, 1)[0];
-
-  return res.status(200).json({
-    success: true,
-    message: "Event deleted successfully",
-    data: deletedEvent, // Return what was deleted, so the user knows what got removed
-  });
 }
 
-// Export all the controller functions so routes/eventRoutes.js can use them.
-// Each function is listed by name — same as naming them in an object.
-module.exports = {
-  getAllEvents,
-  getEventById,
-  createEvent,
-  updateEvent,
-  deleteEvent,
-};
+// -------------------------------------------------------
+// GET /events/upload-url
+// -------------------------------------------------------
+async function getUploadUrl(req, res) {
+  const { fileName, fileType } = req.query;
+  if (!fileName || !fileType)
+    return res.status(400).json({ success: false, message: "fileName and fileType are required", data: null });
+
+  const key = `events/${uuidv4()}-${fileName}`;
+
+  try {
+    const command = new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      ContentType: fileType,
+    });
+    const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+    const imageUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+    return res.status(200).json({ success: true, message: "Upload URL generated", data: { uploadUrl, imageUrl } });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Failed to generate upload URL", data: null });
+  }
+}
+
+module.exports = { getAllEvents, getEventById, createEvent, updateEvent, deleteEvent, getUploadUrl };

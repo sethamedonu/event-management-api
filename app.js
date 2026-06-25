@@ -21,6 +21,7 @@
 // Step 1: Import Express
 // require() is Node.js's way of loading installed packages or files.
 // We installed express via: npm install express
+require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
